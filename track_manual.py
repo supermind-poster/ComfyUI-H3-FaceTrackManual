@@ -15,8 +15,10 @@ import torch
 import torch.nn.functional as F
 
 from .detector import detector_list
-from .video_source import (content_sig, convert_active, file_sig as _file_sig, get as _vs_get,
-                           register_tensor, source_index, target_count)
+from .video_source import (content_sig, convert_active, forget as _vs_forget,
+                           get as _vs_get,
+                           clear_file, register_file, register_tensor, source_index, target_count)
+from .video_source import _files as _vs_files
 
 
 # --------------------------------------------------------------------------- helpers
@@ -36,6 +38,66 @@ def _ranges(text: str, B: int) -> list[tuple[int, int]]:
 
 class _NoKeyframes(ValueError):
     pass
+
+
+def _editor_file(video, sig, n_frames, width, height, fps):
+    """A file the editor can read the frames from, for any VIDEO. Nothing is saved when it can be avoided:
+    1. a copy made earlier for this very video (same fingerprint) in ComfyUI's temp folder -> reused;
+    2. the video already is a file (the standard VIDEO.get_stream_source() gives its path) -> used as is;
+    3. otherwise it is written ONCE to the temp folder (stream bytes, or the standard VIDEO.save_to).
+    Returns the path, or None if nothing worked (the caller then keeps the frames in memory)."""
+    import folder_paths
+    base = os.path.join(folder_paths.get_temp_directory(), "h3manual")
+    path = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", sig) + ".mp4")
+
+    def matches(p):
+        try:
+            idx = _vs_get(p)
+            return idx.frames == n_frames and idx.width == width and idx.height == height
+        except Exception:
+            return False
+
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 0 and matches(path):
+            return path                                         # saved before for this same video
+        src = None
+        try:
+            src = video.get_stream_source()                     # standard: a file path, or the video as bytes
+        except Exception:
+            pass
+        if isinstance(src, str) and os.path.isfile(src):
+            idx = _vs_get(src)
+            if idx.frames == n_frames and idx.width == width and idx.height == height and abs(idx.fps - fps) < 1e-3:
+                return src                                      # the video already is this very file
+        os.makedirs(base, exist_ok=True)
+        part = path + ".part.mp4"
+        try:
+            if hasattr(src, "getvalue"):                        # the stream of the video: no second encode
+                with open(part, "wb") as fh:
+                    fh.write(src.getvalue())
+            else:
+                video.save_to(part)                             # standard VIDEO API
+            if not matches(part):
+                raise RuntimeError("the saved copy does not match the video's frames")
+            _vs_forget(part)
+            os.replace(part, path)
+        except Exception:
+            _vs_forget(part)
+            if os.path.exists(part):
+                os.remove(part)
+            raise
+        olds = sorted((f for f in os.listdir(base) if f.endswith(".mp4") and os.path.join(base, f) != path),
+                      key=lambda f: os.path.getmtime(os.path.join(base, f)), reverse=True)[2:]
+        for f in olds:                                          # keep only the last few copies
+            try:
+                _vs_forget(os.path.join(base, f))
+                os.remove(os.path.join(base, f))
+            except OSError:
+                pass
+        return path
+    except Exception as exc:
+        print(f"[H3FaceTrackManual] could not make a file for the editor ({exc}); keeping the frames in memory instead")
+        return None
 
 
 def _notify(node_id, kind, text):
@@ -237,9 +299,6 @@ class H3FaceTrackManual:
         "The frame rate of `images` (the fps widget, or the source rate when it is 0).",
     )
     FUNCTION = "run"
-    # An output node so the editor can run just this node and what feeds it (to read the frames
-    # that come out of Trim Video / Crop Video / ...) without executing the rest of the graph.
-    OUTPUT_NODE = True
     CATEGORY = "MiniMax H3/Face Refine"
     DESCRIPTION = (
         "Crops a face out of a video for H3 using a box YOU place. Press 'Edit keyframes (graphic)': "
@@ -266,23 +325,13 @@ class H3FaceTrackManual:
                                                               "sample_rate": 44100}
         B, H, W, _ = images.shape
         # Which video were these keyframes made for? The editor writes a comment line at the top of
-        # `keyframes` ("# video: <id>@<fps>"). The id is the file when the frames are exactly the
-        # file's frames, otherwise (Trim / Crop Video in front) a fingerprint of the frames themselves.
-        sig_base = None
-        try:
-            if any(c.__name__ == "VideoFromFile" for c in type(video).__mro__):   # only a file reports a path cheaply
-                path = video.get_stream_source()
-                if isinstance(path, str) and os.path.isfile(path):
-                    idx = _vs_get(path)
-                    if (idx.frames == n_src and idx.width == W and idx.height == H
-                            and abs(idx.fps - src_fps) < 1e-3):
-                        sig_base = _file_sig(path)
-        except Exception:
-            pass
-        if sig_base is None:
-            sig_base = content_sig(images)
-        if unique_id is not None:                              # lets the editor show these very frames
-            register_tensor(unique_id, images, fps_out, sig_base)
+        # `keyframes` ("# video: <id>@<fps>"). The id is a fingerprint of the frames themselves, so it does
+        # not depend on how the video is stored or which node produced it.
+        sig_base = content_sig(raw)                             # of the source frames: a frame-rate change must not change it
+        if unique_id is not None:                              # what the editor holds for this node is stale now?
+            ent = _vs_files.get(str(unique_id))
+            if ent and ent["sig"] != sig_base:
+                clear_file(unique_id)
         cur = f"{sig_base}@{fps_out:.3f}"                       # video + frame rate the numbers refer to
         preview_only = "H3MANUAL_PREVIEW_ONLY" in (keyframes or "")   # sent by the editor to load the frames
         m = re.search(r"^[ \t]*#[ \t]*video:[ \t]*(.+?)[ \t]*$", keyframes or "", re.M)
@@ -297,7 +346,13 @@ class H3FaceTrackManual:
             _notify(unique_id, "reset", "New video detected: the old keyframes, cuts and absent ranges "
                                         "were cleared. Open 'Edit keyframes (graphic)' to set new ones.")
             keyframes, cut_frames, absent_ranges = "", "", ""
-        if preview_only:                                         # frames are registered for the editor: stop here
+        if preview_only:                                         # the editor asked for the frames: hold them, stop here
+            if unique_id is not None:                            # hand the editor a file to read (saved only if needed)
+                f = _editor_file(video, sig_base, n_src, W, H, src_fps)
+                if f:
+                    register_file(unique_id, f, sig_base)
+                else:
+                    register_tensor(unique_id, images, fps_out, sig_base)
             one = images[:1, ..., :3]
             return (one, {}, one, "frames ready for the editor", 0, 0, 0, one, audio, fps_out)
         clamped = []

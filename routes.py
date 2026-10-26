@@ -9,21 +9,6 @@ from server import PromptServer
 from . import video_source
 
 routes = PromptServer.instance.routes
-_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".ts", ".gif")
-
-
-def _path(name):
-    """A file name as Load Video shows it (annotated names like 'clip.mp4 [input]' work too)."""
-    import folder_paths
-    v = str(name or "").strip().strip('"').strip("'")
-    if not v:
-        raise ValueError("no video file given")
-    p = folder_paths.get_annotated_filepath(v)
-    if not p or not os.path.isfile(p):
-        raise FileNotFoundError(f"video not found: {v}")
-    if not p.lower().endswith(_VIDEO_EXTS):
-        raise ValueError("not a video file")
-    return p
 
 
 def _fps(request_or_dict):
@@ -35,12 +20,13 @@ def _fps(request_or_dict):
 
 
 def _src(q):
-    """Where the frames come from: `node` = the frames that node received (Trim/Crop Video in
-    front of it), otherwise `name` = the file chosen in Load Video."""
+    """Where the frames come from: the video the node (`node` = its id) last received - a file on disk
+    (its own, or one saved to ComfyUI's temp folder because it only existed in memory) or, as a last
+    resort, frames held in memory."""
     node = q.get("node") if hasattr(q, "get") else None
-    if node:
-        return video_source.tensor_key(node)
-    return _path(q.get("name"))
+    if not node:
+        raise ValueError("no node given")
+    return video_source.node_source(node)[0]
 
 
 async def _run(fn, *args):
@@ -51,7 +37,16 @@ async def _run(fn, *args):
 @routes.get("/h3manual/vinfo")
 async def h3manual_vinfo(request):
     try:
-        return web.json_response(await _run(video_source.info, _src(request.query), _fps(request)))
+        src = _src(request.query)
+        info = await _run(video_source.info, src, _fps(request))
+        if request.query.get("node"):                      # tell the editor what the node last received
+            ent = video_source.node_source(request.query["node"])[1]
+            info["time"] = ent["time"]
+            info["sig"] = ent["sig"]                       # the id the node itself uses for this video
+            info["kind"] = "file" if isinstance(src, str) else "frames"
+            if isinstance(src, str):
+                info["name"] = os.path.basename(src)
+        return web.json_response(info)
     except Exception as e:
         return web.Response(status=400, text=str(e))
 
@@ -66,6 +61,12 @@ async def h3manual_vframe(request):
         return web.Response(body=body, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
     except Exception as e:
         return web.Response(status=400, text=str(e))
+
+
+@routes.get("/h3manual/release")
+async def h3manual_release(request):
+    video_source.release_tensor(request.query.get("node", ""))      # the editor was closed
+    return web.json_response({"ok": True})
 
 
 # ----------------------------------------------------------------------------- tracking

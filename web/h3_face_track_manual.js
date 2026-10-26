@@ -106,14 +106,10 @@ function linkOrigin(node, inputName) {
   const link = g.links?.get ? g.links.get(inp.link) : g.links?.[inp.link];
   return link ? g.getNodeById(link.origin_id) : null;
 }
-// The video plugged into `video`: a Load Video node directly (its file is read straight from disk), or
-// anything else (Trim Video, Crop Video, ...), in which case the frames the node itself receives are used.
+// Is anything plugged into `video`? (Which node it comes from does not matter: it is a VIDEO.)
 function upstreamVideo(node) {
   const inp = node.inputs?.find((i) => i.name === "video");
-  if (!inp || inp.link == null) return { connected: false, file: null, direct: false };
-  const origin = linkOrigin(node, "video");
-  const fileW = origin && origin.type === "LoadVideo" ? origin.widgets?.find((w) => w.name === "file") : null;
-  return { connected: true, file: fileW?.value || null, direct: !!fileW };
+  return { connected: !!inp && inp.link != null };
 }
 // A string that changes whenever anything feeding `video` (file, trim times, crop values, ...) changes.
 function chainKey(node) {
@@ -154,20 +150,38 @@ async function loadNodeFrames(node) {
   if (!p.output[id]) throw new Error("this node is muted/bypassed or not part of the graph");
   const pruned = prunePrompt(p.output, id);
   pruned[id] = { ...pruned[id], inputs: { ...pruned[id].inputs, keyframes: `#H3MANUAL_PREVIEW_ONLY ${Date.now()}` } };
-  let failed = false;
+  // ComfyUI only runs a prompt that ends in an output node; the node itself is not one, so a do-nothing
+  // helper that saves nothing is put at the end of this tiny prompt (it never appears in your graph).
+  pruned["h3manual_probe"] = { class_type: "H3FaceTrackManualProbe", inputs: { source: [id, 0] } };
+  let failed = false, doneAt = 0;
   const onErr = () => { failed = true; };
+  const onDone = () => { if (!doneAt) doneAt = Date.now(); };
+  const onExec = (ev) => { if (ev.detail === null) onDone(); };            // older frontends: "executing: null" = finished
   api.addEventListener("execution_error", onErr);
+  api.addEventListener("execution_success", onDone);
+  api.addEventListener("execution_interrupted", onErr);
+  api.addEventListener("executing", onExec);
   try {
     await api.queuePrompt(0, { output: pruned, workflow: p.workflow });
     const t0 = Date.now();
+    let lastText = "";
     while (Date.now() - t0 < 10 * 60 * 1000) {
-      if (failed) throw new Error("the nodes feeding this one failed - see the error dialog");
+      if (failed) throw new Error("the nodes feeding this one failed or were interrupted - see the error dialog");
       const r = await fetch(`/h3manual/vinfo?node=${nid}`);
       if (r.ok && ((await r.json()).time || 0) > prev) return;
-      await new Promise((res) => setTimeout(res, 800));
+      if (!r.ok) lastText = await r.text();
+      // the run finished, yet nothing arrived (a run queued earlier may also end first: allow a few seconds)
+      if (doneAt && Date.now() - doneAt > 5000)
+        throw new Error("the run finished but this node did not hand over the video" + (lastText ? ` (${lastText})` : ""));
+      await new Promise((res) => setTimeout(res, 500));
     }
     throw new Error("timed out waiting for the video");
-  } finally { api.removeEventListener("execution_error", onErr); }
+  } finally {
+    api.removeEventListener("execution_error", onErr);
+    api.removeEventListener("execution_success", onDone);
+    api.removeEventListener("execution_interrupted", onErr);
+    api.removeEventListener("executing", onExec);
+  }
 }
 // One keyframe after YOLO has found the face in it: the crop box is moved so the face is in its centre
 // (when `center`), and enlarged when it is smaller than crop_factor asks for (never shrunk).
@@ -221,32 +235,41 @@ function resetNodeData(node) {
 
 // ---------------------------------------------------------------- editor
 async function openEditor(node) {
-  // Load Video plugged in directly: its file is read straight from disk (nothing decoded up front).
-  // Anything else (Trim Video, Crop Video, ...): the frames this very node receives, which a short
-  // run of just this node and what feeds it makes available.
+  // The editor shows the video this node itself received. If the graph has run (or the editor was opened)
+  // since anything in front of the node changed, that video is already known and is opened straight from
+  // disk. Otherwise a short run of just this node and what feeds it hands the video over; a video that
+  // exists only in memory is then saved once to ComfyUI's temp folder (never again for the same input).
   const up = upstreamVideo(node);
-  if (!up.connected) { alert("Connect a video (a Load Video node) to this node's 'video' input first."); return; }
+  if (!up.connected) { alert("Connect a VIDEO output to this node's 'video' input first."); return; }
   const nid = encodeURIComponent(node.id);
-  const source = up.direct && up.file
-    ? { kind: "file", q: `name=${encodeURIComponent(up.file)}`, fps: Number(getW(node, "fps")?.value ?? 24) || 0 }
-    : { kind: "node", q: `node=${nid}`, fps: 0 };                  // those frames are already at the node's fps
-  const fpsParam = source.fps;
-  let info = null;
-  {
-    const hide = toast(source.kind === "file" ? "Opening the video..." : "Reading the video after the nodes in front of this one...");
+  const fpsW = Number(getW(node, "fps")?.value ?? 24) || 0;          // 0 = keep the source rate
+  const chain = chainKey(node);
+  node.properties = node.properties || {};
+  const askInfo = async () => {
+    try { const r = await fetch(`/h3manual/vinfo?node=${nid}&fps=${fpsW}`); return r.ok ? await r.json() : null; } catch (e) { return null; }
+  };
+  const source = { kind: "node", q: `node=${nid}`, fps: fpsW };
+  let m = null;
+  if (node.properties.h3_chain === chain) {                          // nothing in front of the node changed since it last ran
+    m = await askInfo();
+    if (m && m.kind !== "file") m = null;                            // (frames held in memory were released when the editor closed)
+  }
+  if (!m) {
+    const hide = toast("Reading the video from the node...");
     try {
-      if (source.kind === "node") await loadNodeFrames(node);
-      const r = await fetch(`/h3manual/vinfo?${source.q}&fps=${fpsParam}`);
-      if (!r.ok) throw new Error(await r.text());
-      const m = await r.json();
-      const conv = Math.abs(m.fps - m.src_fps) >= 0.001;
-      info = { frames: m.frames, width: m.src_width, height: m.src_height, sig: m.sig, fps: m.fps,
-        marker: `${m.sig}@${Number(m.fps).toFixed(3)}`,
-        label: `${source.kind === "file" ? up.file : "video from the node"}: ${m.frames} frames @ ${Number(m.fps).toFixed(2)} fps` +
-          (conv ? ` (source ${Number(m.src_fps).toFixed(2)} fps, ${m.src_frames} frames)` : "") + `, ${m.src_width}x${m.src_height}` };
+      await loadNodeFrames(node);
+      node.properties.h3_chain = chain;
+      m = await askInfo();
+      if (!m) throw new Error("the node did not hand over its video");
     } catch (e) { alert("Cannot open the video: " + e.message); return; }
     finally { hide(); }
   }
+  const fpsParam = source.fps;
+  const conv = Math.abs(m.fps - m.src_fps) >= 0.001;
+  const info = { frames: m.frames, width: m.src_width, height: m.src_height, sig: m.sig, fps: m.fps,
+    marker: `${m.sig}@${Number(m.fps).toFixed(3)}`,
+    label: `${m.name || "video"}: ${m.frames} frames @ ${Number(m.fps).toFixed(2)} fps` +
+      (conv ? ` (source ${Number(m.src_fps).toFixed(2)} fps, ${m.src_frames} frames)` : "") + `, ${m.src_width}x${m.src_height}` };
   const N = info.frames, VW = info.width, VH = info.height;
   if (!N || !VW) { alert("No frames available."); return; }
   const frameUrl = (idx) => `/h3manual/vframe?${source.q}&index=${idx}&fps=${fpsParam}`;
@@ -629,7 +652,7 @@ async function openEditor(node) {
     busy = true; note = `tracking (${opts.tracker}, every ${opts.stride}, size ${opts.lock ? "locked" : "follows the head"})...`; draw();
     try {
       const r = await fetch("/h3manual/track", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...(source.kind === "file" ? { name: up.file } : { node: String(node.id) }), fps: fpsParam,
+        body: JSON.stringify({ node: String(node.id), fps: fpsParam,
           start, box: face, lo, hi, direction: dir, tracker: opts.tracker }) });
       if (!r.ok) throw new Error(await r.text());
       const res = await r.json();
@@ -675,7 +698,7 @@ async function openEditor(node) {
     busy = true; note = `YOLO: checking ${items.length} keyframe(s)...`; draw();
     try {
       const r = await fetch("/h3manual/calibrate", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...(source.kind === "file" ? { name: up.file } : { node: String(node.id) }), fps: fpsParam,
+        body: JSON.stringify({ node: String(node.id), fps: fpsParam,
           detector: det, confidence: conf, items }) });
       if (!r.ok) throw new Error(await r.text());
       const res = (await r.json()).results;
@@ -778,7 +801,7 @@ async function openEditor(node) {
   }, "#6a2020");
 
   // ---- right side: finish / reset
-  const close = () => { stopPlay(); window.removeEventListener("resize", onResize); overlay.remove(); };
+  const close = () => { fetch(`/h3manual/release?node=${nid}`).catch(() => {}); stopPlay(); window.removeEventListener("resize", onResize); overlay.remove(); };
   target = sideTop;
   btn("Cancel", "Close without saving", close);
   btn("✔ Use these", "Write keyframes, cuts and absent ranges into the node and close", () => {
@@ -823,6 +846,12 @@ async function openEditor(node) {
 app.registerExtension({
   name: "h3.FaceTrackManual",
   async setup() {
+    // when this node really runs, note what was in front of it, so the editor knows its file is current
+    api.addEventListener("executing", (ev) => {
+      if (ev.detail == null) return;
+      const n = app.graph?.getNodeById(Number(ev.detail));
+      if (n && n.type === NODE) { n.properties = n.properties || {}; n.properties.h3_chain = chainKey(n); }
+    });
     // On the fly: the moment another file is chosen in the Load Video node feeding one of our nodes,
     // its keyframes / cuts / absent ranges (made for the previous file) are cleared.
     setInterval(() => {

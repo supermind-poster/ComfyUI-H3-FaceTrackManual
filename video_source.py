@@ -12,7 +12,6 @@ import math
 import os
 import threading
 import time
-import weakref
 
 MAX_OPEN = 2
 _lock = threading.Lock()
@@ -157,22 +156,72 @@ class TensorKey(str):
     Crop Video, ... ): they are served from that node's own output tensor, nothing is copied."""
 
 
-_tensors: dict = {}                                   # node id -> {"ref": weakref, "fps", "sig"}
+_files: dict = {}                                     # node id -> {"path", "sig", "time"}: the file a node's video is
+MAX_TENSORS = 2                                       # frames held for the editor (one per open node)
+_tensors: dict = {}                                   # node id -> {"t": uint8 frames, "fps", "sig", "time"}
 
 
 def content_sig(images) -> str:
-    """Fingerprint of a clip from its content (size + a coarse look at a few frames)."""
+    """Fingerprint of a clip from its content: size, frame count and a coarse look at 24 frames spread
+    over the clip (a shifted trim, a changed crop or another video all give a different one)."""
+    import hashlib
     import torch.nn.functional as F
     B, H, W = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
-    idx = sorted({0, B // 4, B // 2, (3 * B) // 4, B - 1})
+    n = min(24, B)
+    idx = sorted({round(i * (B - 1) / max(1, n - 1)) for i in range(n)})
     x = images[idx][..., :3].float().mean(-1).unsqueeze(1)
-    p = F.adaptive_avg_pool2d(x, (16, 16)).clamp(0, 1).mul(15).round().byte()
-    import hashlib
-    return f"content:{B}x{H}x{W}:" + hashlib.md5(p.cpu().numpy().tobytes()).hexdigest()[:16]
+    p = F.adaptive_avg_pool2d(x, (32, 32)).clamp(0, 1).mul(63).round().to(__import__("torch").uint8)
+    return f"content:{B}x{H}x{W}:" + hashlib.md5(p.cpu().numpy().tobytes()).hexdigest()[:20]
 
 
 def register_tensor(node_id, images, fps: float, sig: str):
-    _tensors[str(node_id)] = {"ref": weakref.ref(images), "fps": float(fps), "sig": sig, "time": time.time()}
+    """Keep the frames a node received (after Trim / Crop Video ...) for the editor. They are held as
+    8-bit pictures - ComfyUI frees its own copy right after the run - and released when the editor
+    closes (release_tensor), so nothing is saved and nothing stays in memory afterwards."""
+    import torch
+    n, h, w = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
+    u8 = torch.empty((n, h, w, 3), dtype=torch.uint8)
+    for a in range(0, n, 32):
+        u8[a:a + 32] = images[a:a + 32, ..., :3].float().clamp(0, 1).mul(255).round().to(torch.uint8)
+    _tensors[str(node_id)] = {"t": u8, "fps": float(fps), "sig": sig, "time": time.time()}
+    _files.pop(str(node_id), None)
+    while len(_tensors) > MAX_TENSORS:
+        del _tensors[min(_tensors, key=lambda k: _tensors[k]["time"])]
+
+
+def release_tensor(node_id):
+    _tensors.pop(str(node_id), None)
+
+
+def register_file(node_id, path: str, sig: str):
+    """The video a node received IS this file (a Load Video, or a Trim / Crop node that wrote one to
+    temp). Only the path is remembered, so the editor can open it later without running anything."""
+    _files[str(node_id)] = {"path": path, "sig": sig, "time": time.time()}
+    _tensors.pop(str(node_id), None)
+
+
+def clear_file(node_id):
+    _files.pop(str(node_id), None)
+
+
+def forget(path: str):
+    """Drop the cached reader of a file (before it is replaced or deleted)."""
+    with _lock:
+        ent = _open.pop(path, None)
+    if ent:
+        ent[1].close()
+
+
+def node_source(node_id):
+    """(source, entry) for the video a node last received: the file when there is one, otherwise
+    the frames held for the editor."""
+    k = str(node_id)
+    ent = _files.get(k)
+    if ent and os.path.isfile(ent["path"]):
+        return ent["path"], ent
+    if k in _tensors:
+        return tensor_key(k), _tensors[k]
+    raise FileNotFoundError("this node has not received a video yet (or its file is gone)")
 
 
 def tensor_key(node_id) -> TensorKey:
@@ -189,15 +238,17 @@ class _TensorIndex:
 
     def rgb(self, i):
         i = max(0, min(self.frames - 1, int(i)))
-        return self.t[i, ..., :3].float().clamp(0, 1).mul(255).round().byte().cpu().numpy()
+        f = self.t[i, ..., :3]
+        if f.dtype != __import__("torch").uint8:
+            f = f.float().clamp(0, 1).mul(255).round().to(__import__("torch").uint8)
+        return f.cpu().numpy()
 
 
 def _tensor_entry(key):
     ent = _tensors.get(str(key))
-    t = ent["ref"]() if ent else None
-    if t is None:
-        raise FileNotFoundError("the video of this node is not in memory (anymore): run the graph once")
-    return ent, t
+    if ent is None:
+        raise FileNotFoundError("the video of this node is not loaded (anymore): open the editor again")
+    return ent, ent["t"]
 
 
 def get(path):

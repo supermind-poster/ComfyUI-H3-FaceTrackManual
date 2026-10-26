@@ -63,5 +63,27 @@ class H3AudioForKeptFrames:
         return ({"waveform": out, "sample_rate": sr},)
 
 
-NODE_CLASS_MAPPINGS = {"H3AudioForKeptFrames": H3AudioForKeptFrames}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3AudioForKeptFrames": "H3 Audio For Kept Frames"}
+class H3FaceTrackManualProbe:
+    """Not meant to be placed by hand. When the editor needs the frames that come out of Trim Video /
+    Crop Video / ..., it runs a tiny prompt made of those nodes, H3 Face Track Manual and this node.
+    ComfyUI only runs a prompt that ends in an output node; this one is that end, so H3 Face Track
+    Manual itself does not have to be an output node. It does nothing and saves nothing."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"source": ("IMAGE",)}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    DEV_ONLY = True                                   # keeps it out of the node search
+    CATEGORY = "MiniMax H3/Face Refine"
+
+    def run(self, source):
+        return ()
+
+
+NODE_CLASS_MAPPINGS = {"H3AudioForKeptFrames": H3AudioForKeptFrames,
+                       "H3FaceTrackManualProbe": H3FaceTrackManualProbe}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3AudioForKeptFrames": "H3 Audio For Kept Frames",
+                              "H3FaceTrackManualProbe": "H3 Face Track Manual (editor helper)"}
