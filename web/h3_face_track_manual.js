@@ -183,21 +183,27 @@ async function loadNodeFrames(node) {
     api.removeEventListener("executing", onExec);
   }
 }
-// One keyframe after YOLO has found the face in it: the crop box is moved so the face is in its centre
-// (when `center`), and enlarged when it is smaller than crop_factor asks for (never shrunk).
+// One keyframe after YOLO has found the face in it. The crop box is
+//  - moved so the face is in its centre (when `center`), and
+//  - sized so crop height = face height x crop_factor exactly (when `matchRatio`): zoomed in when the box
+//    was too wide, zoomed out when it was too tight, so the ratio is the same on every keyframe.
+//    Without `matchRatio` a box that is already bigger is left alone (it is only ever enlarged).
 // `fitFn(cx, cy, h)` builds the box (right aspect ratio, inside the frame).
-function calibrateBox(box, face, cf, aspect, center, fitFn) {
-  const fh = face[3] - face[1], fw = face[2] - face[0];
-  const need = cf * Math.max(fh, fw / aspect);                 // crop height asked for by crop_factor
+function calibrateBox(box, face, cf, aspect, center, matchRatio, fitFn) {
+  const fh = face[3] - face[1];
+  const need = cf * fh;                                        // the crop height crop_factor asks for
   const have = box[3] - box[1];
-  const h = Math.max(have, need);
+  const h = matchRatio ? need : Math.max(have, need);
   const cx = center ? (face[0] + face[2]) / 2 : (box[0] + box[2]) / 2;
   const cy = center ? (face[1] + face[3]) / 2 : (box[1] + box[3]) / 2;
   const nb = fitFn(cx, cy, h);
+  const got = nb[3] - nb[1];
   const shift = Math.hypot((nb[0] + nb[2]) / 2 - (box[0] + box[2]) / 2, (nb[1] + nb[3]) / 2 - (box[1] + box[3]) / 2);
   const off = Math.hypot((nb[0] + nb[2]) / 2 - (face[0] + face[2]) / 2, (nb[1] + nb[3]) / 2 - (face[1] + face[3]) / 2);
-  return { box: nb, grown: h > have + 0.5, ratio: h / have, moved: center && shift > 0.5,
-    notCentered: center && off > 0.01 * (nb[3] - nb[1]) };     // the frame edge stopped it
+  return { box: nb, grown: got > have + 0.5, shrunk: got < have - 0.5, ratio: got / have,
+    moved: center && shift > 0.5,
+    notCentered: center && off > 0.01 * got,                   // the frame edge stopped it
+    capped: matchRatio && got < need - 1 };                    // the frame is too small for that crop
 }
 const splitMarker = (m) => {
   if (!m) return { sig: null, fps: 0 };
@@ -289,7 +295,7 @@ async function openEditor(node) {
   const cuts = new Set(parseInts(getW(node, "cut_frames")?.value).filter((c) => c > 0 && c < N));
   let absent = parseRanges(getW(node, "absent_ranges")?.value)
     .filter(([a]) => a < N).map(([a, b]) => [a, Math.min(b, N - 1)]);
-  let note = staleClip ? "new video: previous keyframes were cleared" : rescaled ? "frame rate changed: keyframes, cuts and absent were rescaled" : "", busy = false, frame = 0, img = null, token = 0, pendingAbsent = null, drag = null;
+  let note = staleClip ? "new video: previous keyframes were cleared" : rescaled ? "frame rate changed: keyframes, cuts and absent were rescaled" : "", busy = false, frame = 0, img = null, imgFrame = -1, token = 0, pendingAbsent = null, drag = null;
   const cache = new Map();
 
   // ---- DOM
@@ -327,16 +333,20 @@ async function openEditor(node) {
   css(canvas, { position: "absolute", inset: "0", cursor: "crosshair" });
   area.appendChild(canvas);
   const foot = document.createElement("div");
-  css(foot, { padding: "8px", borderTop: "1px solid #333" });
+  css(foot, { padding: "8px", borderTop: "1px solid #333", flex: "none" });
   const strip = document.createElement("canvas");
-  strip.height = 18;
-  css(strip, { width: "100%", height: "18px", display: "block" });
+  strip.height = 22;
+  css(strip, { width: "100%", height: "22px", display: "block", flex: "none", cursor: "pointer", touchAction: "none" });
   const slider = document.createElement("input");
   slider.type = "range"; slider.min = 0; slider.max = N - 1; slider.value = 0;
   css(slider, { width: "100%", margin: "4px 0" });
-  const status = document.createElement("div");
-  css(status, { fontFamily: "monospace", opacity: ".85" });
-  foot.append(strip, slider, status);
+  // two text rows of a fixed height: a long message is cut with "..." (hover for all of it) instead of
+  // wrapping, because a wrapping line used to push the strip and slider around while scrubbing
+  const textRow = { fontFamily: "monospace", opacity: ".85", whiteSpace: "nowrap", overflow: "hidden",
+    textOverflow: "ellipsis", height: "1.5em", lineHeight: "1.5em" };
+  const status = document.createElement("div"); css(status, textRow);
+  const noteLine = document.createElement("div"); css(noteLine, textRow);
+  foot.append(strip, slider, status, noteLine);
   overlay.append(bar, area, foot);
 
   const btn = (label, title, fn, color) => {
@@ -425,36 +435,40 @@ async function openEditor(node) {
   function draw() {
     ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (img) ctx.drawImage(img, offX, offY, VW * scale, VH * scale);
-    const b = viewBox(frame);
+    // the box is drawn for the frame the picture on screen belongs to, so it never runs ahead of the
+    // picture while the next frame is still loading
+    const shown = img && imgFrame >= 0 ? imgFrame : frame;
+    const b = viewBox(shown);
     if (b) {
-      const isKey = !!kf[frame];
       const [x0, y0] = toScr(b[0], b[1]), [x1, y1] = toScr(b[2], b[3]);
-      ctx.setLineDash(isKey ? [] : [5, 4]);
-      ctx.strokeStyle = isAbsent(frame) ? "#f44" : (isKey ? "#f0f" : "#0ff");
+      ctx.setLineDash(kf[shown] ? [] : [5, 4]);                 // solid = keyframe, dashed = interpolated
+      ctx.strokeStyle = "#f0f";                                  // one colour, always
       ctx.lineWidth = 2; ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
-      ctx.setLineDash([]); ctx.fillStyle = ctx.strokeStyle;
+      ctx.setLineDash([]); ctx.fillStyle = "#f0f";
       for (const [hx, hy] of [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]) ctx.fillRect(hx - 5, hy - 5, 10, 10);
     }
     drawStrip();
-    const kcount = keys().length;
+    const vb = viewBox(frame);
     status.textContent =
-      `[${info.label}]   frame ${frame}/${N - 1}   keyframes: ${kcount}   cuts: ${cuts.size}   absent ranges: ${absent.length}` +
-      (kf[frame] ? "   [KEYFRAME]" : (viewBox(frame) ? "   [interpolated - drag to make it a keyframe]" : "   [no box yet - click on the image]")) +
-      (isAbsent(frame) ? "   [ABSENT]" : "") + (note ? `   | ${note}` : "") +
-      (pendingAbsent !== null ? `   (absent range started at ${pendingAbsent})` : "") +
-      (viewBox(frame) ? `   crop: ${Math.round(viewBox(frame)[2] - viewBox(frame)[0])}x${Math.round(viewBox(frame)[3] - viewBox(frame)[1])}  at ${viewBox(frame).slice(0, 2).map((v) => Math.round(v)).join(",")}` : "");
+      `[${info.label}]   frame ${frame}/${N - 1}   keyframes: ${keys().length}   cuts: ${cuts.size}   absent ranges: ${absent.length}` +
+      (kf[frame] ? "   [KEYFRAME]" : (vb ? "   [interpolated - drag to make it a keyframe]" : "   [no box yet - click on the image]")) +
+      (isAbsent(frame) ? "   [ABSENT]" : "") +
+      (vb ? `   crop: ${Math.round(vb[2] - vb[0])}x${Math.round(vb[3] - vb[1])}  at ${vb.slice(0, 2).map((v) => Math.round(v)).join(",")}` : "");
+    status.title = status.textContent;
+    noteLine.textContent = (note || "") + (pendingAbsent !== null ? `${note ? "   " : ""}(absent range started at ${pendingAbsent})` : "");
+    noteLine.title = noteLine.textContent;
   }
   function drawStrip() {
     const c = strip.getContext("2d"), W = strip.width, H = strip.height;
     c.clearRect(0, 0, W, H); c.fillStyle = "#1b1b20"; c.fillRect(0, 0, W, H);
     const px = (f) => (f / Math.max(1, N - 1)) * (W - 1);
-    c.fillStyle = "rgba(255,60,60,.45)";
+    c.fillStyle = "rgba(255,60,60,.45)";                                       // absent ranges
     for (const [a, b] of absent) c.fillRect(px(a), 0, Math.max(2, px(b) - px(a)), H);
-    c.fillStyle = "#fa0";
+    c.fillStyle = "#fa0";                                                      // cuts
     for (const f of cuts) c.fillRect(px(f) - 1, 0, 2, H);
-    c.fillStyle = "#f0f";
-    for (const f of keys()) c.fillRect(px(f) - 1.5, 4, 3, H - 8);
-    c.fillStyle = "#fff"; c.fillRect(px(frame) - 1, 0, 2, H);
+    c.fillStyle = "#a8a8b0";                                                   // keyframes: grey dots
+    for (const f of keys()) { c.beginPath(); c.arc(px(f), H / 2, 3, 0, Math.PI * 2); c.fill(); }
+    c.fillStyle = "#fff"; c.fillRect(px(frame) - 1, 0, 2, H);                  // where you are
   }
 
   // ---- frames
@@ -463,12 +477,12 @@ async function openEditor(node) {
     slider.value = frame;
     const idx = frame, t = ++token;
     const hit = cache.get(idx);
-    if (hit) { img = hit; draw(); return; }
+    if (hit) { img = hit; imgFrame = idx; draw(); return; }
     const im = new Image();
     im.onload = () => {
       cache.set(idx, im);
       if (cache.size > 80) cache.delete(cache.keys().next().value);
-      if (t === token) { img = im; draw(); }
+      if (t === token) { img = im; imgFrame = idx; draw(); }
     };
     im.src = frameUrl(idx);
     draw();
@@ -510,6 +524,7 @@ async function openEditor(node) {
   };
   canvas.addEventListener("pointerdown", (e) => {
     stopPlay();
+    if (imgFrame !== frame) return;                      // the picture is still loading: nothing to edit yet
     const [px, py] = pos(e);
     const b = viewBox(frame);
     drag = null;
@@ -566,11 +581,16 @@ async function openEditor(node) {
 
   // ---- timeline
   slider.addEventListener("input", () => { stopPlay(); load(+slider.value); });
-  strip.addEventListener("pointerdown", (e) => {
-    stopPlay();
+  let scrubbing = false;
+  const scrubTo = (e) => {
     const r = strip.getBoundingClientRect();
-    load(Math.round(((e.clientX - r.left) / r.width) * (N - 1)));
-  });
+    load(Math.round(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * (N - 1)));
+  };
+  strip.addEventListener("pointerdown", (e) => { stopPlay(); scrubbing = true; strip.setPointerCapture(e.pointerId); scrubTo(e); });
+  strip.addEventListener("pointermove", (e) => { if (scrubbing) scrubTo(e); });
+  const endScrub = () => { scrubbing = false; };
+  strip.addEventListener("pointerup", endScrub);
+  strip.addEventListener("pointercancel", endScrub);
 
   // ---- actions
   const jump = (dir) => {
@@ -687,9 +707,16 @@ async function openEditor(node) {
   css(ctrLbl, { opacity: ".85", cursor: "pointer" });
   target.appendChild(ctrLbl);
 
+  const ratioLbl = document.createElement("label");
+  const ratioCb = document.createElement("input"); ratioCb.type = "checkbox"; ratioCb.checked = true;
+  ratioLbl.append(ratioCb, " keep crop ratio");
+  ratioLbl.title = "YOLO Calibrate only. Ticked: every box is sized so crop height = face height x crop_factor exactly (zoomed in or out), so the face has the same size inside the crop on every keyframe. Unticked: a box that is already bigger than that is left as it is (boxes are only ever enlarged).";
+  css(ratioLbl, { opacity: ".85", cursor: "pointer" });
+  target.appendChild(ratioLbl);
+
   async function runCalibrate() {
     if (busy) return;
-    const center = ctrCb.checked;                               // read now, at the click
+    const center = ctrCb.checked, matchRatio = ratioCb.checked;   // read now, at the click
     const det = getW(node, "detector")?.value, conf = Number(getW(node, "confidence")?.value ?? 0.35);
     const cf = Number(getW(node, "crop_factor")?.value) || 2.5;
     const items = keys().filter((k) => !isAbsent(k)).map((k) => ({ frame: k, box: kf[k] }));
@@ -703,26 +730,30 @@ async function openEditor(node) {
       if (!r.ok) throw new Error(await r.text());
       const res = (await r.json()).results;
       const aspect = cfg().aspect;
-      let grown = 0, moved = 0, edge = 0, none = 0, biggest = 1;
+      let grown = 0, shrunk = 0, moved = 0, edge = 0, capped = 0, none = 0, biggest = 1, smallest = 1;
       for (const it of res) {
         if (!it.face) { none++; continue; }
         const bx = kf[it.frame];
         if (!bx) continue;
-        const o = calibrateBox(bx, it.face, cf, aspect, center, fit);
+        const o = calibrateBox(bx, it.face, cf, aspect, center, matchRatio, fit);
         kf[it.frame] = o.box;
         if (o.grown) { grown++; biggest = Math.max(biggest, o.ratio); }
+        if (o.shrunk) { shrunk++; smallest = Math.min(smallest, o.ratio); }
         if (o.moved) moved++;
         if (o.notCentered) edge++;
+        if (o.capped) capped++;
       }
-      note = `YOLO Calibrate: ${res.length} keyframe(s): ` + (center ? `${moved} re-centred on the face, ` : "") +
-        `${grown} enlarged` + (grown ? ` (up to x${biggest.toFixed(2)})` : "") +
+      note = `YOLO Calibrate: ${res.length} keyframe(s): ` + (center ? `${moved} re-centred, ` : "") +
+        `${grown} zoomed out` + (grown ? ` (up to x${biggest.toFixed(2)})` : "") +
+        (matchRatio ? `, ${shrunk} zoomed in` + (shrunk ? ` (down to x${smallest.toFixed(2)})` : "") : "") +
         (edge ? `, ${edge} could not be centred (frame edge)` : "") +
+        (capped ? `, ${capped} could not reach the ratio (frame too small)` : "") +
         `, ${none} without a face found` + (none ? " (left as they are)" : "");
     } catch (err) {
       note = ""; alert("YOLO Calibrate failed: " + err.message);
     } finally { busy = false; draw(); }
   }
-  btn("YOLO Calibrate", "Checks every keyframe (except those in absent ranges) with the face detector chosen in the node. With 'center on face' the box is moved so the face is in its centre; a box smaller than the face needs (crop height = face height x crop_factor) is enlarged around that centre, a bigger one is never shrunk. Keyframes where no face is found stay as they are. The tracker settings do not apply.", runCalibrate, "#4a3a1a");
+  btn("YOLO Calibrate", "Checks every keyframe (except those in absent ranges) with the face detector chosen in the node. With 'center on face' the box is moved so the face is in its centre. With 'keep crop ratio' it is sized so crop height = face height x crop_factor exactly, zoomed in or out; without it a bigger box is left alone. Keyframes where no face is found stay as they are. The tracker settings do not apply.", runCalibrate, "#4a3a1a");
 
   // ---- cuts row
   target = rowCut;
@@ -801,7 +832,7 @@ async function openEditor(node) {
   }, "#6a2020");
 
   // ---- right side: finish / reset
-  const close = () => { fetch(`/h3manual/release?node=${nid}`).catch(() => {}); stopPlay(); window.removeEventListener("resize", onResize); overlay.remove(); };
+  const close = () => { fetch(`/h3manual/release?node=${nid}`).catch(() => {}); stopPlay(); if (ro) ro.disconnect(); window.removeEventListener("resize", onResize); overlay.remove(); };
   target = sideTop;
   btn("Cancel", "Close without saving", close);
   btn("✔ Use these", "Write keyframes, cuts and absent ranges into the node and close", () => {
@@ -834,6 +865,8 @@ async function openEditor(node) {
   });
   const onResize = () => { layout(); draw(); };
   window.addEventListener("resize", onResize);
+  const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onResize) : null;
+  if (ro) { ro.observe(area); ro.observe(strip); }
 
   document.body.appendChild(overlay);
   layout();
